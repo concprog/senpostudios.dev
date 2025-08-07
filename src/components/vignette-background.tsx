@@ -8,6 +8,20 @@ import { FontLoader } from 'three/examples/jsm/loaders/FontLoader.js';
 import { TextGeometry } from 'three/examples/jsm/geometries/TextGeometry.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
+// Debounce hook
+function useDebounce<T>(value: T, delay: number): T {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value);
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedValue(value);
+    }, delay);
+    return () => {
+      clearTimeout(handler);
+    };
+  }, [value, delay]);
+  return debouncedValue;
+}
+
 interface VignetteBackgroundProps {
   text: string;
   formText: boolean;
@@ -19,11 +33,10 @@ const VignetteBackground: React.FC<VignetteBackgroundProps> = ({
 }) => {
   const pointsRef = useRef<THREE.Points>(null);
   const [font, setFont] = useState<THREE.Font | null>(null);
-  const [initialPositions, setInitialPositions] = useState<Float32Array | null>(
-    null
-  );
+  const [initialPositions, setInitialPositions] = useState<Float32Array | null>(null);
   const [textTargets, setTextTargets] = useState<Float32Array | null>(null);
   const { viewport } = useThree();
+  const debouncedViewport = useDebounce(viewport, 500);
 
   const count = 2000;
 
@@ -32,22 +45,15 @@ const VignetteBackground: React.FC<VignetteBackgroundProps> = ({
     new FontLoader().load('/font.json', (f) => setFont(f));
   }, []);
 
-  // 2. Generate vignette positions once
+  // 2. Generate initial sphere positions once
   const rawVignette = useMemo(() => {
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(2, 32, 32));
+    const sampler = new MeshSurfaceSampler(sphere).build();
     const arr = new Float32Array(count * 3);
-    const radius = 4;
+    const tmp = new THREE.Vector3();
     for (let i = 0; i < count; i++) {
-      const r = Math.sqrt(Math.random()) * radius;
-      const theta = Math.random() * Math.PI * 2;
-      const x =
-        Math.sign(r * Math.cos(theta)) *
-        Math.pow(Math.abs(r * Math.cos(theta)), 1.5);
-      const y =
-        Math.sign(r * Math.sin(theta)) *
-        Math.pow(Math.abs(r * Math.sin(theta)), 1.5);
-      arr[3 * i] = x;
-      arr[3 * i + 1] = y;
-      arr[3 * i + 2] = (Math.random() - 0.5) * 0.5;
+      sampler.sample(tmp);
+      arr.set([tmp.x, tmp.y, tmp.z], i * 3);
     }
     return arr;
   }, [count]);
@@ -57,22 +63,18 @@ const VignetteBackground: React.FC<VignetteBackgroundProps> = ({
     setInitialPositions(rawVignette.slice());
   }, [rawVignette]);
 
-  // 4. Sample text, then **sort both arrays by polar angle**
-  useEffect(() => {
-    if (!font || !initialPositions) return;
+  // 4. Create text mesh
+  const textMesh = useMemo(() => {
+    if (!font) return null;
 
-    const fontSize = Math.min(viewport.width, viewport.height) * 0.2;
-    const maxWidth = viewport.width * 0.8;
+    const fontSize = Math.min(debouncedViewport.width, debouncedViewport.height) * 0.2;
+    const maxWidth = debouncedViewport.width * 0.8;
 
-    const createTextGeometry = (
-      text: string,
-      font: THREE.Font,
-      size: number
-    ) => {
+    const createTextGeometry = (text: string, font: THREE.Font, size: number) => {
       return new TextGeometry(text, {
         font,
         size,
-        height: 0.2,
+        // height: 0.2,
         curveSegments: 12,
         bevelEnabled: true,
         bevelThickness: 0.03,
@@ -82,17 +84,16 @@ const VignetteBackground: React.FC<VignetteBackgroundProps> = ({
       });
     };
 
-    const lines = text.split(' ');
+    const words = text.split(' ');
     let currentLine = '';
     const lineGeometries: THREE.BufferGeometry[] = [];
     let yOffset = 0;
 
-    lines.forEach((word) => {
+    words.forEach((word) => {
       const testLine = currentLine === '' ? word : `${currentLine} ${word}`;
       const testGeom = createTextGeometry(testLine, font, fontSize);
       testGeom.computeBoundingBox();
-      const testWidth =
-        testGeom.boundingBox!.max.x - testGeom.boundingBox!.min.x;
+      const testWidth = testGeom.boundingBox!.max.x - testGeom.boundingBox!.min.x;
 
       if (testWidth > maxWidth && currentLine !== '') {
         const lineGeom = createTextGeometry(currentLine, font, fontSize);
@@ -112,59 +113,37 @@ const VignetteBackground: React.FC<VignetteBackgroundProps> = ({
     }
 
     const mergedGeometry = mergeGeometries(lineGeometries);
-    if (!mergedGeometry) return;
+    if (!mergedGeometry) return null;
 
     mergedGeometry.center();
-    const mesh = new THREE.Mesh(mergedGeometry);
-    const sampler = new MeshSurfaceSampler(mesh).build();
+    return new THREE.Mesh(mergedGeometry);
+  }, [font, text, debouncedViewport]);
+
+  // 5. Sample text positions
+  useEffect(() => {
+    if (!textMesh) return;
+
+    const sampler = new MeshSurfaceSampler(textMesh).build();
 
     const sampled = new Float32Array(count * 3);
     const tmp = new THREE.Vector3();
     for (let i = 0; i < count; i++) {
       sampler.sample(tmp);
-      sampled[3 * i] = tmp.x;
-      sampled[3 * i + 1] = tmp.y;
-      sampled[3 * i + 2] = tmp.z;
+      sampled.set([tmp.x, tmp.y, tmp.z], i * 3);
     }
 
-    // --- compute polar angles for both sets
-    const initialIdx = Array.from({ length: count }, (_, i) => i);
-    const textIdx = Array.from({ length: count }, (_, i) => i);
+    setTextTargets(sampled);
+  }, [textMesh, count]);
 
-    const angleOf = (arr: Float32Array, i: number) =>
-      Math.atan2(arr[3 * i + 1], arr[3 * i]);
-
-    initialIdx.sort(
-      (a, b) => angleOf(rawVignette, a) - angleOf(rawVignette, b)
-    );
-    textIdx.sort((a, b) => angleOf(sampled, a) - angleOf(sampled, b));
-
-    // --- re-align into two new arrays, sorted by angle
-    const sortedText = new Float32Array(count * 3);
-    for (let k = 0; k < count; k++) {
-      const ti = textIdx[k];
-      sortedText[3 * k] = sampled[3 * ti];
-      sortedText[3 * k + 1] = sampled[3 * ti + 1];
-      sortedText[3 * k + 2] = sampled[3 * ti + 2];
-    }
-
-    setTextTargets(sortedText);
-  }, [font, text, initialPositions, count, rawVignette, viewport]);
-
-  // 5. On each frame, lerp toward textTargets or back to initialPositions + wave
+  // 6. On each frame, lerp toward textTargets or back to initialPositions + wave
   useFrame(({ clock }) => {
     if (!pointsRef.current || !initialPositions) return;
-    const posArr = pointsRef.current.geometry.attributes.position
-      .array as Float32Array;
+    const posArr = pointsRef.current.geometry.attributes.position.array as Float32Array;
     const t = clock.getElapsedTime();
 
     for (let i = 0; i < count; i++) {
       const idx = 3 * i;
-      const cur = new THREE.Vector3(
-        posArr[idx],
-        posArr[idx + 1],
-        posArr[idx + 2]
-      );
+      const cur = new THREE.Vector3(posArr[idx], posArr[idx + 1], posArr[idx + 2]);
 
       if (formText && textTargets) {
         const tx = textTargets[idx],
